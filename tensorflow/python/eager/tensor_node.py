@@ -21,7 +21,7 @@ from __future__ import print_function
 from autograd import core as ag_core
 
 from tensorflow.python.eager import context
-from tensorflow.python.eager import tape
+from tensorflow.python.eager import custom_gradient
 from tensorflow.python.eager import tensor
 from tensorflow.python.framework import common_shapes
 from tensorflow.python.framework import dtypes
@@ -43,6 +43,15 @@ def _as_gpu_tensor(t, index=0):
 
 _as_gpu_tensor.defvjp(
     lambda g, ans, vs, gvs, t, index: g.as_cpu_tensor(), argnum=0)
+
+
+@custom_gradient.custom_gradient
+def _tensor_copy(t, ctx=None, device_name=None):
+
+  def grad(dresult):
+    return dresult._copy(device_name=t.device)  # pylint: disable=protected-access
+
+  return t.value._copy(ctx=ctx, device_name=device_name), grad  # pylint: disable=protected-access
 
 
 @ag_core.primitive
@@ -87,8 +96,8 @@ class TensorNode(ag_core.Node):
   def as_gpu_tensor(self, gpu_index=0):
     return _as_gpu_tensor(self, gpu_index)
 
-  def __len__(self):
-    return len(self.value)
+  def _copy(self, ctx=None, device_name=None):
+    return _tensor_copy(self, ctx, device_name)
 
   def __neg__(self):
     return math_ops.negative(self)
@@ -170,14 +179,6 @@ class TensorNode(ag_core.Node):
       return math_ops.equal(self, other)
     return False
 
-  def __ne__(self, other):
-    # math_ops.not_equal raises an error if shapes are not compatible, so check
-    # explicitly first.
-    if common_shapes.is_broadcast_compatible(
-        self.shape, ops.convert_to_tensor(other).shape):
-      return math_ops.not_equal(self, other)
-    return True
-
   def __gt__(self, other):
     return math_ops.greater(self, other)
 
@@ -245,22 +246,18 @@ class TensorVSpace(ag_core.VSpace):
   """VSpace for tf/tfe Tensors in autograd."""
 
   def __init__(self, value):
+    self.size = 1
     if isinstance(value, ops.IndexedSlices):
       self.shape = tensor_shape.TensorShape(value.dense_shape.numpy())
       self.dtype = value.values.dtype
     else:
-      self.shape = value.shape
+      self.shape = value._shape_tuple()  # pylint: disable=protected-access
       self.dtype = value.dtype
-    self.size = self.shape.num_elements()
     # TODO(apassos) put gradients on the same device as ops.
 
   def __eq__(self, other):
-    if isinstance(other, tape.NoneVSpace):
-      return True
-    if self.dtype == dtypes.resource or other.dtype == dtypes.resource:
-      return True
-    return (type(self) == type(other)  # pylint: disable=unidiomatic-typecheck
-            and self.dtype == other.dtype)
+    # TODO(apassos) consider revisiting this if not performance sensitive.
+    return True
 
   def __ne__(self, other):
     return not self.__eq__(other)
@@ -290,6 +287,10 @@ class TensorVSpace(ag_core.VSpace):
       x = _indexed_slices_to_tensor(x)
     if isinstance(y, ops.IndexedSlices):
       y = _indexed_slices_to_tensor(y)
+    if x is None:
+      return y
+    if y is None:
+      return x
     return math_ops.add(x, y)
 
 
